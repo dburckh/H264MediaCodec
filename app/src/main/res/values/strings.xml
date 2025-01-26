@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">MediaCodecTest</string>
+    <string name="delay">Delay Ms: %d</string>
+</resources>
