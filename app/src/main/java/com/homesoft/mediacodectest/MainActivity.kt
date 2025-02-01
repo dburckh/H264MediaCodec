@@ -1,13 +1,14 @@
 package com.homesoft.mediacodectest
 
 import android.content.Context
-import android.graphics.Camera
 import android.graphics.ImageFormat
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG
 import android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME
 import android.media.MediaCodec.LinearBlock
+import android.media.MediaCodec.PARAMETER_KEY_LOW_LATENCY
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
@@ -81,7 +82,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             val imageChannel = camera.start(this)
             launch(Dispatchers.Main) {
                 while (true) {
-                    delay(500)
+                    delay(250)
                     delayText.text = getString(R.string.delay, renderer.averageDelayMs)
                 }
             }
@@ -109,7 +110,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * Simulate a camera operating at 30 fps
      */
     class Camera(private val context: Context) {
-        private val frameMs = TimeUnit.SECONDS.toMillis(1) / 30
+        private val frameMs = frameUs / 1000L
         lateinit var sps:ByteBuffer
         lateinit var pps:ByteBuffer
 
@@ -140,7 +141,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 channel.send(configBuffer)
 
                 var startIndex = idrStart
-                while (true) {
+                // At 15 frames no video will show for most H264 codecs
+//                while (true) {
+                for (i in 0..15) {
                     val nextIndex = nalUnitFinder.findNext(startIndex)
                     val byteBuffer = ByteBuffer.allocateDirect(nextIndex - startIndex)
                     nalUnitFinder.put(byteBuffer, startIndex, nextIndex)
@@ -161,25 +164,41 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     class Renderer(private val surface: Surface):MediaCodec.Callback() {
         var averageDelayMs: Long = 0
             private set
-        private val inputBuffers = Channel<Int>(Channel.UNLIMITED)
+        private var inputBuffers = Channel<Int>(Channel.UNLIMITED)
         private lateinit var mediaCodec: MediaCodec
-        private val frameUs = TimeUnit.SECONDS.toMicros(1) / 30
         private val deque = ArrayDeque<Long>()
 
         suspend fun start(sps:ByteBuffer, pps:ByteBuffer, imageChannel: ReceiveChannel<ByteBuffer>) {
             val mediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT)
 
-            mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+            mediaFormat.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             mediaFormat.setByteBuffer("csd-0", sps)
             mediaFormat.setByteBuffer("csd-1", pps)
-
-            val mediaCodecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            val decoderName = mediaCodecList.findDecoderForFormat(mediaFormat)
-
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                mediaFormat.setFeatureEnabled(
+                    MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency,
+                    true)
+            }
+            val mediaCodecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            var decoderName = mediaCodecList.findDecoderForFormat(mediaFormat)
+            if (decoderName == null) {
+                Log.w(TAG, "No low-latency decoder")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    mediaFormat.setFeatureEnabled(
+                        MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency,
+                        false)
+                }
+                decoderName = mediaCodecList.findDecoderForFormat(mediaFormat)
+            }
+            //decoderName = "OMX.google.h264.decoder"
+            //decoderName = "c2.android.avc.decoder"
+            //decoderName = "c2.mtk.avc.decoder" // Works!!
+            //decoderName "c2.exynos.h264.decoder" // Fails, but declared as low latency
             mediaCodec = MediaCodec.createByCodecName(decoderName)
             val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) MediaCodec.CONFIGURE_FLAG_USE_BLOCK_MODEL else 0
             mediaCodec.setCallback(this)
             mediaCodec.configure(mediaFormat, surface, null, flags)
+            //mediaCodec.configure(mediaFormat, null, null, flags)
             mediaCodec.start()
 
             if (flags == MediaCodec.CONFIGURE_FLAG_USE_BLOCK_MODEL) {
@@ -213,7 +232,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
 
         private suspend fun loop21(imageChannel: ReceiveChannel<ByteBuffer>) {
-            var frameTimeUs = 0L
             while (true) {
                 val imageBuffer = imageChannel.receive()
                 val now = SystemClock.uptimeMillis()
@@ -229,14 +247,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         inputIndex,
                         0,
                         imageBuffer.position(),
-                        frameTimeUs,
+                        nowUs(),
                         flags
                     )
-                    if (flags == BUFFER_FLAG_KEY_FRAME) {
-                        frameTimeUs = System.nanoTime() / 1000
-                    } else {
-                        frameTimeUs += frameUs
-                    }
                 }
             }
         }
@@ -252,8 +265,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     val codecBuffer = linearBlock.map()
                     codecBuffer.put(imageBuffer)
                     request.setLinearBlock(linearBlock, 0, imageBuffer.capacity())
-                    request.setPresentationTimeUs(System.nanoTime() / 1000)
+                    request.setPresentationTimeUs(nowUs())
                     request.setFlags(flags)
+                    request.setIntegerParameter(PARAMETER_KEY_LOW_LATENCY, 1)
                     request.queue()
                 }
             }
@@ -268,7 +282,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             index: Int,
             info: MediaCodec.BufferInfo
         ) {
-            val delayMs = (System.nanoTime() / 1000L - info.presentationTimeUs) / 1000
+            val delayMs = (nowUs() - info.presentationTimeUs) / 1000
             deque.addLast(delayMs)
             if (deque.size > 16) {
                 deque.removeFirst()
@@ -298,5 +312,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         const val TAG = "H264Tester"
         const val WIDTH = 640
         const val HEIGHT = 480
+        val frameUs = TimeUnit.SECONDS.toMicros(1) / 30
+
+        fun nowUs():Long {
+            return System.nanoTime() / 1000L
+        }
     }
 }
